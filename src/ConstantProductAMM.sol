@@ -20,7 +20,7 @@ contract ConstantProductAMM is ERC20 {
     event Swap(address indexed trader, address tokenIn, uint256 amountIn, uint256 amountOut);
 
     /**
-     * @dev Initialize the trading pair pool. 
+     * @dev Initialize the trading pair pool.
      * The contract name "Alea LP Token" represents the share receipts given to providers. (LP = Liquidity Provider)
      */
     constructor(address _token0, address _token1) ERC20("Alea Liquidity Provider Token", "ALEA-LP") {
@@ -43,7 +43,7 @@ contract ConstantProductAMM is ERC20 {
         uint256 totalPoolShares = totalSupply();
         if (totalPoolShares == 0) {
             // Primitive initialization calculation
-            shares = amount0Desired + amount1Desired; 
+            shares = amount0Desired + amount1Desired;
         } else {
             // Proportional share assignment based on the constant product ratio
             uint256 share0 = (amount0Desired * totalPoolShares) / reserve0;
@@ -52,7 +52,7 @@ contract ConstantProductAMM is ERC20 {
         }
 
         require(shares > 0, "AMM: INSUFFICIENT_SHARES_MINTED");
-        
+
         // 3. Mint the custom ERC-20 LP shares *of this contract* to the liquidity provider
         _mint(msg.sender, shares);
 
@@ -64,11 +64,11 @@ contract ConstantProductAMM is ERC20 {
     }
 
     /**
-    * @notice Allows a liquidity provider to burn their LP shares to reclaim their underlying Token0 and Token1.
-    * @param lpSharesBurned The quantity of Alea-LP tokens the user wants to trade back in.
-    * @return amount0 The exact amount of Token0 returned to the user's wallet.
-    * @return amount1 The exact amount of Token1 returned to the user's wallet.
-    */
+     * @notice Allows a liquidity provider to burn their LP shares to reclaim their underlying Token0 and Token1.
+     * @param lpSharesBurned The quantity of Alea-LP tokens the user wants to trade back in.
+     * @return amount0 The exact amount of Token0 returned to the user's wallet.
+     * @return amount1 The exact amount of Token1 returned to the user's wallet.
+     */
     function removeLiquidity(uint256 lpSharesBurned) external returns (uint256 amount0, uint256 amount1) {
         require(lpSharesBurned > 0, "AMM: INSUFFICIENT_SHARES_BURNED");
         require(balanceOf(msg.sender) >= lpSharesBurned, "AMM: EXCEEDS_LP_BALANCE");
@@ -105,9 +105,8 @@ contract ConstantProductAMM is ERC20 {
         require(amountIn > 0, "AMM: INSUFFICIENT_INPUT_AMOUNT");
 
         bool isToken0 = tokenIn == address(token0);
-        (IERC20 tIn, IERC20 tOut, uint256 rIn, uint256 rOut) = isToken0 
-            ? (token0, token1, reserve0, reserve1) 
-            : (token1, token0, reserve1, reserve0);
+        (IERC20 tIn, IERC20 tOut, uint256 rIn, uint256 rOut) =
+            isToken0 ? (token0, token1, reserve0, reserve1) : (token1, token0, reserve1, reserve0);
 
         // 1. Pull the trader's incoming tokens
         tIn.transferFrom(msg.sender, address(this), amountIn);

@@ -8,11 +8,11 @@ library AMMMath {
      * @param reserveIn The current pool reserve balance of the incoming token.
      * @param reserveOut The current pool reserve balance of the outgoing token.
      */
-    function getAmountOut(
-        uint256 amountIn,
-        uint256 reserveIn,
-        uint256 reserveOut
-    ) internal pure returns (uint256 amountOut) {
+    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut)
+        internal
+        pure
+        returns (uint256 amountOut)
+    {
         // Absolute requirement: The pool must have active liquidity
         require(reserveIn > 0 && reserveOut > 0, "AMM: INSUFFICIENT_LIQUIDITY");
 
