@@ -65,7 +65,7 @@ contract ConstantProductAMMTest is Test {
         token0.approve(address(amm), 1000 * 10 ** 18);
 
         uint256 expectedOut = AMMMath.getAmountOut(1000 * 10 ** 18, 20000 * 10 ** 18, 10 * 10 ** 18);
-        uint256 actualOut = amm.swap(address(token0), 1000 * 10 ** 18);
+        uint256 actualOut = amm.swap(address(token0), 1000 * 10 ** 18, expectedOut, block.timestamp);
         vm.stopPrank();
 
         // Assert the pricing calculation was perfectly executed
@@ -73,6 +73,46 @@ contract ConstantProductAMMTest is Test {
         assertTrue(actualOut > 0, "Trader should receive tokens");
 
         console2.log("WETH Received by Trader:", actualOut / 10 ** 15, "x 10^-3");
+    }
+
+    function test_SwapRevertsOnSlippage() public {
+        // Step A: Establish the same baseline liquidity (20,000 USDC : 10 WETH)
+        vm.startPrank(liquidityProvider);
+        token0.approve(address(amm), 20000 * 10 ** 18);
+        token1.approve(address(amm), 10 * 10 ** 18);
+        amm.addLiquidity(20000 * 10 ** 18, 10 * 10 ** 18);
+        vm.stopPrank();
+
+        // Step B: Trader demands MORE output than the curve can possibly deliver
+        vm.startPrank(trader);
+        token0.approve(address(amm), 1000 * 10 ** 18);
+
+        uint256 fairOut = AMMMath.getAmountOut(1000 * 10 ** 18, 20000 * 10 ** 18, 10 * 10 ** 18);
+
+        // Asking for 1 wei more than the fair quote must trip the slippage guardrail
+        vm.expectRevert("AMM: INSUFFICIENT_OUTPUT_AMOUNT_SLIPPAGE");
+        amm.swap(address(token0), 1000 * 10 ** 18, fairOut + 1, block.timestamp);
+        vm.stopPrank();
+    }
+
+    function test_SwapRevertsOnExpiredDeadline() public {
+        // Step A: Establish baseline liquidity
+        vm.startPrank(liquidityProvider);
+        token0.approve(address(amm), 20000 * 10 ** 18);
+        token1.approve(address(amm), 10 * 10 ** 18);
+        amm.addLiquidity(20000 * 10 ** 18, 10 * 10 ** 18);
+        vm.stopPrank();
+
+        // Move the clock forward so any past deadline is now stale
+        vm.warp(1000);
+
+        vm.startPrank(trader);
+        token0.approve(address(amm), 1000 * 10 ** 18);
+
+        // A deadline one second in the past must be rejected before execution
+        vm.expectRevert("AMM: EXPIRED");
+        amm.swap(address(token0), 1000 * 10 ** 18, 0, block.timestamp - 1);
+        vm.stopPrank();
     }
 
     function test_RemoveLiquidity() public {
@@ -115,7 +155,7 @@ contract ConstantProductAMMTest is Test {
         vm.startPrank(trader);
         token0.mint(trader, swapAmount); // Ensure trader has enough funds
         token0.approve(address(amm), swapAmount);
-        amm.swap(address(token0), swapAmount);
+        amm.swap(address(token0), swapAmount, 0, block.timestamp); // No slippage floor: accept any output
         vm.stopPrank();
 
         uint256 kAfter = amm.reserve0() * amm.reserve1();

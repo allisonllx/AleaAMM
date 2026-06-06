@@ -98,11 +98,20 @@ contract ConstantProductAMM is ERC20 {
     }
 
     /**
-     * @notice The execution loop that swaps Token0 for Token1 (or vice-versa).
+     * @notice Executes an atomic asset swap with built-in queue-cutting (slippage) protection.
+     * @param tokenIn The address of the asset being deposited.
+     * @param amountIn The exact quantity of tokens the trader is committing.
+     * @param minAmountOut The minimum acceptable tokens the trader must receive (slippage guardrail).
+     * @param deadline Unix timestamp after which the swap is rejected (staleness guardrail).
+     * @return amountOut The exact quantity of opposing tokens sent to the trader's wallet.
      */
-    function swap(address tokenIn, uint256 amountIn) external returns (uint256 amountOut) {
-        require(tokenIn == address(token0) || tokenIn == address(token1), "AMM: INVALID_TOKEN");
+    function swap(address tokenIn, uint256 amountIn, uint256 minAmountOut, uint256 deadline)
+        external
+        returns (uint256 amountOut)
+    {
+        require(block.timestamp <= deadline, "AMM: EXPIRED");
         require(amountIn > 0, "AMM: INSUFFICIENT_INPUT_AMOUNT");
+        require(tokenIn == address(token0) || tokenIn == address(token1), "AMM: INVALID_TOKEN");
 
         bool isToken0 = tokenIn == address(token0);
         (IERC20 tIn, IERC20 tOut, uint256 rIn, uint256 rOut) =
@@ -114,10 +123,13 @@ contract ConstantProductAMM is ERC20 {
         // 2. Execute our safe fixed-point math calculation formula
         amountOut = AMMMath.getAmountOut(amountIn, rIn, rOut);
 
-        // 3. Disburse the output tokens back to the user
+        // 3. Slippage guardrail: if the price degraded past the trader's tolerance, revert the whole trade
+        require(amountOut >= minAmountOut, "AMM: INSUFFICIENT_OUTPUT_AMOUNT_SLIPPAGE");
+
+        // 4. Disburse the output tokens back to the user
         tOut.transfer(msg.sender, amountOut);
 
-        // 4. Re-sync internal records with the actual token balances remaining inside the vault
+        // 5. Re-sync internal records with the actual token balances remaining inside the vault
         reserve0 = token0.balanceOf(address(this));
         reserve1 = token1.balanceOf(address(this));
 

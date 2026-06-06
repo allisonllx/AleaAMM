@@ -184,10 +184,14 @@ As traders pay the 0.3% fee, reserves grow, so each LP share becomes redeemable 
 
 A trader sends in one token and receives the other, priced by the constant-product formula.
 
-```103:125:src/ConstantProductAMM.sol
-    function swap(address tokenIn, uint256 amountIn) external returns (uint256 amountOut) {
-        require(tokenIn == address(token0) || tokenIn == address(token1), "AMM: INVALID_TOKEN");
+```108:137:src/ConstantProductAMM.sol
+    function swap(address tokenIn, uint256 amountIn, uint256 minAmountOut, uint256 deadline)
+        external
+        returns (uint256 amountOut)
+    {
+        require(block.timestamp <= deadline, "AMM: EXPIRED");
         require(amountIn > 0, "AMM: INSUFFICIENT_INPUT_AMOUNT");
+        require(tokenIn == address(token0) || tokenIn == address(token1), "AMM: INVALID_TOKEN");
 
         bool isToken0 = tokenIn == address(token0);
         (IERC20 tIn, IERC20 tOut, uint256 rIn, uint256 rOut) =
@@ -199,10 +203,13 @@ A trader sends in one token and receives the other, priced by the constant-produ
         // 2. Execute our safe fixed-point math calculation formula
         amountOut = AMMMath.getAmountOut(amountIn, rIn, rOut);
 
-        // 3. Disburse the output tokens back to the user
+        // 3. Slippage guardrail: if the price degraded past the trader's tolerance, revert the whole trade
+        require(amountOut >= minAmountOut, "AMM: INSUFFICIENT_OUTPUT_AMOUNT_SLIPPAGE");
+
+        // 4. Disburse the output tokens back to the user
         tOut.transfer(msg.sender, amountOut);
 
-        // 4. Re-sync internal records with the actual token balances remaining inside the vault
+        // 5. Re-sync internal records with the actual token balances remaining inside the vault
         reserve0 = token0.balanceOf(address(this));
         reserve1 = token1.balanceOf(address(this));
 
@@ -211,6 +218,16 @@ A trader sends in one token and receives the other, priced by the constant-produ
 ```
 
 The function figures out which direction the trade goes (`isToken0`), pulls the input token in, computes the output, and sends the output token out. The `(tIn, tOut, rIn, rOut)` tuple keeps "in" and "out" correctly paired regardless of direction.
+
+### Slippage protection (`minAmountOut`)
+
+The trader passes a `minAmountOut` — the smallest output they are willing to accept. If another transaction lands first and moves the price (a front-run / sandwich attack), the computed `amountOut` may drop below that floor, and the `require` reverts the entire swap atomically so the trader never gets a worse deal than they signed up for. Passing `minAmountOut = 0` opts out of protection (accept any output), which is convenient in tests but unsafe in production.
+
+Note that `minAmountOut` must be an **absolute** amount, not a percentage. A percentage tolerance only means something relative to a reference price, and the only reference a contract has at execution time is its current reserves — which is exactly what an attacker manipulates. So the percentage is applied **off-chain** at signing time (when the user sees a quote), and the resulting absolute floor is what the contract enforces. This is why Uniswap and friends take an absolute `amountOutMin` on-chain.
+
+### Deadline protection (`deadline`)
+
+The trader also passes a `deadline` (a Unix timestamp). If the transaction is still sitting in the mempool when `block.timestamp` passes it, the swap reverts with `AMM: EXPIRED` instead of executing at a stale price. Without this, a transaction could be held back by validators and executed much later under very different market conditions. Slippage and deadline are complementary: `minAmountOut` bounds *how bad a price* you accept, while `deadline` bounds *how long* the order stays valid.
 
 ### The 0.3% fee and the pricing formula
 
@@ -272,7 +289,7 @@ By storing reserves explicitly and only updating them at the end of each call, t
 
 The fuzz test asserts the core property — that `k` never shrinks across a swap — over **256 randomized inputs**:
 
-```99:124:test/ConstantProductAMM.t.sol
+```140:165:test/ConstantProductAMM.t.sol
     function testFuzz_SwapMathInvariance(uint256 swapAmount) public {
         // Bound our fuzz inputs to reasonable token amounts (between 1 wei and 1,000 tokens)
         // to prevent extreme overflow limits that break mock setups.
@@ -291,7 +308,7 @@ The fuzz test asserts the core property — that `k` never shrinks across a swap
         vm.startPrank(trader);
         token0.mint(trader, swapAmount); // Ensure trader has enough funds
         token0.approve(address(amm), swapAmount);
-        amm.swap(address(token0), swapAmount);
+        amm.swap(address(token0), swapAmount, 0, block.timestamp); // No slippage floor: accept any output
         vm.stopPrank();
 
         uint256 kAfter = amm.reserve0() * amm.reserve1();
@@ -307,12 +324,85 @@ This is **property-based testing**: rather than checking one hand-picked example
 
 ---
 
-## 8. Limitations
+## 8. The Factory-Router architecture
+
+A single pool only knows how to trade its own two tokens. Real AMMs scale to many tokens by splitting responsibilities across two extra contracts: a **Factory** that mass-produces pools, and a **Router** that chains trades across them.
+
+### The Factory: a pool registry
+
+`AMMFactory` deploys a fresh `ConstantProductAMM` for any token pair and remembers it, so the same pair can never be created twice:
+
+```26:43:src/AMMFactory.sol
+    function createPair(address tokenA, address tokenB) external returns (address pair) {
+        require(tokenA != tokenB, "AMM: IDENTICAL_ADDRESSES");
+
+        // Canonical ordering guarantees a single deterministic slot per unordered pair.
+        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        require(token0 != address(0), "AMM: ZERO_ADDRESS");
+        require(getPair[token0][token1] == address(0), "AMM: PAIR_EXISTS");
+
+        // Conjure a dedicated pool contract out of thin air for this pair.
+        ConstantProductAMM newPair = new ConstantProductAMM(token0, token1);
+        pair = address(newPair);
+
+        // Register in both directions so lookups succeed regardless of argument order.
+        getPair[token0][token1] = pair;
+        getPair[token1][token0] = pair;
+        allPairs.push(pair);
+
+        emit PairCreated(token0, token1, pair, allPairs.length - 1);
+    }
+```
+
+**Canonical ordering** means sorting the two tokens by the numeric value of their *addresses* (not their names), so `token0` is always the smaller address. This collapses `createPair(A, B)` and `createPair(B, A)` to the same registry slot, guaranteeing one pool per unordered pair. The factory stores the lookup in both directions so callers never have to sort themselves.
+
+### The Router: multi-hop swaps
+
+If you want to trade A for C but only A/B and B/C pools exist, the `AMMRouter` bridges through B in a single transaction. It first quotes every leg, checks the final slippage floor, then executes each hop, carrying the output of one into the next:
+
+```55:74:src/AMMRouter.sol
+    ) external returns (uint256[] memory amounts) {
+        require(block.timestamp <= deadline, "AMM: EXPIRED");
+
+        amounts = getAmountsOut(amountIn, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, "AMM: INSUFFICIENT_OUTPUT_AMOUNT");
+
+        // Pull the trader's starting funds into the router.
+        IERC20(path[0]).transferFrom(msg.sender, address(this), amountIn);
+
+        // Walk each leg: approve the pool, swap, and carry the output into the next hop.
+        for (uint256 i; i < path.length - 1; i++) {
+            ConstantProductAMM pair = _pairFor(path[i], path[i + 1]);
+            IERC20(path[i]).approve(address(pair), amounts[i]);
+            // Each leg's pre-quoted output doubles as its own minimum; the loop is atomic.
+            pair.swap(path[i], amounts[i], amounts[i + 1], deadline);
+        }
+```
+
+### Worked example: routing 1,000 A → C through B
+
+Suppose both pools start balanced at 10,000 : 10,000, and there is no direct A/C pool.
+
+1. **Quote** (`getAmountsOut`, a read-only view): leg A→B gives `getAmountOut(1000, 10000, 10000) ≈ 906.6 B`; leg B→C gives `getAmountOut(906.6, 10000, 10000) ≈ 828.2 C`. Note the erosion `1000 → 906.6 → 828.2` — each hop pays the 0.3% fee *and* incurs curve slippage.
+2. **Slippage check**: revert immediately if `828.2 < amountOutMin`, before any tokens move.
+3. **Pull input**: 1,000 A moves from trader → router.
+4. **Leg A→B**: router approves pool A/B, calls `swap`; pool pulls the 1,000 A and sends ~906.6 B back to the router.
+5. **Leg B→C**: router approves pool B/C, calls `swap`; pool pulls the 906.6 B and sends ~828.2 C back to the router.
+6. **Forward**: router transfers the ~828.2 C to the recipient.
+
+### Why "atomic" matters
+
+All of those steps happen inside one transaction, and the EVM guarantees a transaction is **all-or-nothing**. If any leg reverts — say pool B/C was drained by a front-runner and its per-leg `swap` check fails — then the leg that already executed is rolled back too. The trader can never end up stranded holding intermediate B tokens; they either get their final C or keep their original A. The router safely custodying tokens mid-route works precisely because those intermediate balances only exist *within* the transaction.
+
+---
+
+## 9. Limitations
 
 This is an educational implementation and is **not production-ready**:
 
 - ERC-20 `transfer` / `transferFrom` return values are not checked (no `SafeERC20`).
-- `swap` has no slippage protection (`minAmountOut`) or deadline, so it is exposed to front-running / sandwich attacks.
+- `swap` now enforces both a `minAmountOut` slippage floor and a `deadline` staleness guardrail, but liquidity provision (`addLiquidity` / `removeLiquidity`) still has neither.
 - The first-deposit share calculation is simplified (sum of amounts) rather than a geometric mean (`sqrt(amount0 * amount1)`) with a minimum-liquidity lock, which real AMMs use to resist share-price manipulation.
+- The router custodies tokens between hops rather than using the send-directly-to-next-pool optimization, and does not deduplicate repeated pools within a path.
 
 See [`PLAN.md`](../PLAN.md) for planned extensions that address several of these.
